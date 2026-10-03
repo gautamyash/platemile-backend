@@ -1,0 +1,36 @@
+# Render Blueprint for the PlateMile API. Plans are placeholders: pick them in the Render dashboard.
+databases:
+  - name: platemile-db
+    databaseName: platemile
+    user: platemile
+    plan: free            # change to a paid plan before launch; check Render's current free-plan limits
+
+services:
+  - type: web
+    name: platemile-api
+    runtime: python
+    plan: free            # change to a paid plan before launch (free instances sleep when idle)
+    buildCommand: pip install -r requirements.txt
+    startCommand: alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.5
+      - key: DATABASE_URL
+        fromDatabase:
+          name: platemile-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DEV_LOGIN_ENABLED
+        value: "false"
+      - key: RATE_LIMIT_ENABLED
+        value: "false"       # set to true once a Redis (Render Key Value) is attached and REDIS_URL is set
+      - key: AI_MODE
+        value: engine
+      - key: GOOGLE_CLIENT_ID
+        value: 227529199057-i861ac6hc1po8ap13m62jtug7jjutdn6.apps.googleusercontent.com
+      - key: SUPPORT_EMAIL
+        sync: false          # you will be asked for this in the dashboard
+      - key: GEMINI_API_KEY
+        sync: false          # optional: only /ai/coach uses it
