@@ -18,6 +18,7 @@ from app import models  # noqa: F401
 from app.db import Base, get_session
 from app.main import app
 from app.seed_foods import seed_foods
+from app.seed_recipes import seed_recipes
 
 
 def _ensure_test_database() -> None:
@@ -57,6 +58,7 @@ async def client(monkeypatch):
         await conn.run_sync(Base.metadata.create_all)
     maker = async_sessionmaker(engine, expire_on_commit=False)
     await seed_foods(maker)
+    await seed_recipes(maker)
 
     async def override():
         async with maker() as s:

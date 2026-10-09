@@ -10,6 +10,7 @@ from app.routers import (
     auth,
     credits,
     foods,
+    legal,
     logs,
     plans,
     profile,
@@ -19,6 +20,7 @@ from app.routers import (
     settings,
 )
 from app.seed_foods import seed_foods
+from app.seed_recipes import seed_recipes
 
 
 @asynccontextmanager
@@ -27,11 +29,15 @@ async def lifespan(_: FastAPI):
         await seed_foods(SessionLocal)
     except Exception:  # e.g. migrations not applied yet; the API must still start
         logging.getLogger("seed").exception("food catalogue seeding failed")
+    try:
+        await seed_recipes(SessionLocal)
+    except Exception:  # the engine keeps serving the recipes from the data files
+        logging.getLogger("seed").exception("recipe seeding failed")
     yield
 
 
 app = FastAPI(title="PlateMile API", version="0.3.0", lifespan=lifespan)
-for r in (auth, profile, logs, foods, progress, plans, saved, settings, credits, ai, reports, account):
+for r in (auth, profile, logs, foods, progress, plans, saved, settings, credits, ai, reports, account, legal):
     app.include_router(r.router)
 
 

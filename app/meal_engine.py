@@ -95,6 +95,8 @@ class Recipe:
     tokens: frozenset[str]  # name + ingredients, lower-case, plural-tolerant
     blob: str
     main: str
+    jain_ok: bool = False  # no onion, garlic, root vegetables, mushroom, brinjal, honey, egg or meat
+    og_free: bool = False  # no onion or garlic
 
     @property
     def protein_density(self) -> float:
@@ -103,6 +105,32 @@ class Recipe:
 
 def _tokens(text: str) -> frozenset[str]:
     return frozenset(safety._tokenize(text))
+
+
+# Onion/garlic words (English + common Indian names) and the wider Jain list (root vegetables, fungi, brinjal, honey).
+ONION_GARLIC = {"onion", "onions", "garlic", "pyaz", "pyaaz", "piyaz", "lehsun", "lahsun", "lasun", "shallot", "shallots",
+                "kanda", "leek", "leeks", "scallion", "scallions"}
+JAIN_AVOID = ONION_GARLIC | {
+    "potato", "potatoes", "aloo", "alu", "batata", "carrot", "carrots", "gajar", "beetroot", "beetroots", "beet", "beets",
+    "radish", "radishes", "mooli", "turnip", "turnips", "shalgam", "ginger", "adrak", "yam", "suran", "jimikand", "arbi",
+    "colocasia", "taro", "mushroom", "mushrooms", "brinjal", "brinjals", "baingan", "eggplant", "honey", "shakarkandi",
+    "ratalu", "kand",
+}
+# dried ginger is accepted in Jain cooking; strip these phrases before checking
+_JAIN_OK_PHRASES = ("dry ginger", "dried ginger", "ginger powder", "saunth", "sonth")
+
+
+def _jain_ok(name: str, ingredients, diet: str) -> bool:
+    if diet not in ("vegan", "veg"):
+        return False
+    text = (name + " " + " ".join(ingredients)).lower()
+    for ph in _JAIN_OK_PHRASES:
+        text = text.replace(ph, " ")
+    return not (JAIN_AVOID & _tokens(text))
+
+
+def _og_free(name: str, ingredients) -> bool:
+    return not (ONION_GARLIC & _tokens(name + " " + " ".join(ingredients)))
 
 
 _MAIN_WORDS = {
@@ -253,38 +281,63 @@ def _build(d: dict) -> Recipe:
         servings_note=d["servings_note"].strip(), ingredients=tuple(d["ingredients"]), steps=tuple(d["steps"]),
         kcal=float(d["kcal"]), protein_g=float(d["protein_g"]), carbs_g=float(d["carbs_g"]), fat_g=float(d["fat_g"]),
         fibre_g=float(d["fibre_g"]), tokens=tokens, blob=blob, main=_main_ingredient(d["name"], d["ingredients"]),
+        jain_ok=_jain_ok(d["name"], d["ingredients"], d["diet"]), og_free=_og_free(d["name"], d["ingredients"]),
     )
 
 
-def load_recipes() -> tuple[list[Recipe], list[tuple[str, list[str]]], dict[str, str]]:
-    """Returns (valid recipes, [(name, problems)] for skipped ones, name -> module)."""
-    ok: list[Recipe] = []
-    skipped: list[tuple[str, list[str]]] = []
-    origin: dict[str, str] = {}
-    seen: set[str] = set()
+def file_recipe_dicts() -> list[tuple[str, dict]]:
+    """Raw recipe dicts from app/meal_data/*.py as (module name, dict). Used to seed the database and as a fallback."""
+    out: list[tuple[str, dict]] = []
     for info in sorted(pkgutil.iter_modules(meal_data.__path__), key=lambda i: i.name):
         if info.name.startswith("__"):
             continue
         try:
             mod = importlib.import_module(f"{meal_data.__name__}.{info.name}")
-            raw = list(mod.RECIPES)
+            out.extend((info.name, d) for d in list(mod.RECIPES))
         except Exception:  # a broken data file must not take the API down
             log.exception("meal_data.%s could not be loaded", info.name)
-            skipped.append((info.name, ["module failed to import"]))
+    return out
+
+
+def build_recipes(raw: list[tuple[str, dict]]) -> tuple[list[Recipe], list[tuple[str, list[str]]], dict[str, str]]:
+    """Validates and builds recipes. Returns (valid recipes, [(name, problems)] for skipped ones, name -> source)."""
+    ok: list[Recipe] = []
+    skipped: list[tuple[str, list[str]]] = []
+    origin: dict[str, str] = {}
+    seen: set[str] = set()
+    for src, d in raw:
+        label = d.get("name", "?") if isinstance(d, dict) else "?"
+        problems = validate_recipe(d) if isinstance(d, dict) else ["not a dict"]
+        if not problems and d["name"].strip().lower() in seen:
+            problems.append("duplicate name")
+        if problems:
+            log.error("recipe %s (%s): skipping: %s", label, src, "; ".join(problems))
+            skipped.append((label, problems))
             continue
-        for d in raw:
-            label = d.get("name", "?") if isinstance(d, dict) else "?"
-            problems = validate_recipe(d) if isinstance(d, dict) else ["not a dict"]
-            if not problems and d["name"].strip().lower() in seen:
-                problems.append("duplicate name")
-            if problems:
-                log.error("meal_data.%s: skipping %r: %s", info.name, label, "; ".join(problems))
-                skipped.append((label, problems))
-                continue
-            seen.add(d["name"].strip().lower())
-            origin[d["name"].strip()] = info.name
-            ok.append(_build(d))
+        seen.add(d["name"].strip().lower())
+        origin[d["name"].strip()] = src
+        ok.append(_build(d))
     return ok, skipped, origin
+
+
+def load_recipes() -> tuple[list[Recipe], list[tuple[str, list[str]]], dict[str, str]]:
+    """Returns (valid recipes, [(name, problems)] for skipped ones, name -> module). Reads the data files."""
+    return build_recipes(file_recipe_dicts())
+
+
+def install_recipes(raw: list[tuple[str, dict]]) -> int:
+    """Replaces the in-memory recipe set (in place, so existing references stay valid) with `raw` after validation.
+    Does nothing and returns 0 if no recipe is valid. Returns the number of recipes now served."""
+    ok, skipped, origin = build_recipes(raw)
+    if not ok:
+        return 0
+    RECIPES[:] = ok
+    SKIPPED[:] = skipped
+    ORIGIN.clear()
+    ORIGIN.update(origin)
+    BY_NAME.clear()
+    BY_NAME.update({r.name.lower(): r for r in ok})
+    return len(ok)
 
 
 # ------------------------------------------------------------------------------------------ eligibility
@@ -307,6 +360,8 @@ class _Filter:
         self.allergies = [a for a in (r.get("allergies") or []) if a and a.strip()]
         self.dislikes = [d.strip().lower() for d in (r.get("dislikes") or []) if d and d.strip()]
         self.allowed_diets = _DIET_ALLOWED.get(self.diet_type, _DIET_ALLOWED["veg"])
+        self.jain = bool(r.get("jain"))
+        self.no_onion_garlic = bool(r.get("no_onion_garlic"))
         self.tags: set[str] = set()
         self.words: set[str] = set()
         for a in self.allergies:
@@ -318,6 +373,10 @@ class _Filter:
 
     def ok(self, r: Recipe) -> bool:
         if r.diet not in self.allowed_diets:
+            return False
+        if self.jain and not r.jain_ok:
+            return False
+        if self.no_onion_garlic and not r.og_free:
             return False
         if self.tags & r.allergens or self.words & r.tokens:
             return False
@@ -532,12 +591,47 @@ class NoMealFound(Exception):
     """No recipe satisfies the profile's restrictions (even after relaxing preferences)."""
 
 
+# Meal Finder "food type" chip -> recipe diets wanted (always intersected with what the profile allows).
+FOOD_TYPE_DIETS = {
+    "veg": {"vegan", "veg"},
+    "vegan": {"vegan"},
+    "egg": {"egg"},
+    "non_veg": {"nonveg"},
+    "jain": {"vegan", "veg"},
+}
+CUISINE_TAGS = {
+    "south_indian": {"south_indian", "kerala", "hyderabadi", "chettinad"},
+    "north_indian": {"north_indian", "punjabi", "kashmiri", "rajasthani"},
+}
+
+
+def narrow_pool(pool: list[Recipe], food_type: str | None = None, cuisine: str | None = None, n: int = 3) -> list[Recipe]:
+    """Applies the finder's food-type and cuisine chips. Never widens the profile's pool; a chip that would leave
+    too few recipes is ignored (cuisine) or relaxed to the closest safe set (food type)."""
+    if food_type in FOOD_TYPE_DIETS:
+        want = FOOD_TYPE_DIETS[food_type]
+        sub = [r for r in pool if r.diet in want and (food_type != "jain" or r.jain_ok)]
+        if not sub and food_type in ("egg", "non_veg"):
+            sub = list(pool)  # profile does not allow it (e.g. a veg profile tapping Non-veg): stay within the profile
+        if food_type == "jain":
+            pool = sub  # Jain is a hard rule, never relaxed
+        elif sub:
+            pool = sub
+    if cuisine in CUISINE_TAGS:
+        sub = [r for r in pool if r.tags & CUISINE_TAGS[cuisine]]
+        if len(sub) >= n:
+            pool = sub
+    return pool
+
+
 def find_meals(
     profile, day_kcal: float, meal_type: str, rng: random.Random, *, tags=(), max_minutes: int | None = None,
-    max_kcal: int | None = None, home=(), n: int = 3, slots=None,
+    max_kcal: int | None = None, home=(), n: int = 3, slots=None, food_type: str | None = None, cuisine: str | None = None,
 ) -> list[Meal]:
     """Meal Finder. Relaxes tags first, then max_minutes, then (slightly) max_kcal before giving up."""
-    pool = eligible_pool(profile, meal_type)
+    pool = narrow_pool(eligible_pool(profile, meal_type), food_type, cuisine, n)
+    if not pool:
+        raise NoMealFound(meal_type)
     target = slot_target(day_kcal, meal_type, slots)
     if max_kcal:
         target = min(target, max_kcal)

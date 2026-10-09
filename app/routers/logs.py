@@ -21,11 +21,11 @@ class FoodIn(BaseModel):
     meal_type: MealType
     name: str = Field(min_length=1, max_length=120)
     quantity: str = Field(default="", max_length=60)
-    kcal: float = Field(ge=0, le=5000)
-    protein_g: float = Field(default=0, ge=0, le=500)
-    carbs_g: float = Field(default=0, ge=0, le=1000)
-    fat_g: float = Field(default=0, ge=0, le=500)
-    fibre_g: float = Field(default=0, ge=0, le=200)
+    kcal: float = Field(ge=0, le=12000)  # up to 10 servings of a large meal
+    protein_g: float = Field(default=0, ge=0, le=1000)
+    carbs_g: float = Field(default=0, ge=0, le=2000)
+    fat_g: float = Field(default=0, ge=0, le=1000)
+    fibre_g: float = Field(default=0, ge=0, le=400)
     source: Literal["manual", "ai"] = "manual"
 
 

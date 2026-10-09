@@ -29,6 +29,8 @@ class Restrictions(BaseModel):
     allergies: list[str] = Field(default_factory=list, max_length=20)
     dislikes: list[str] = Field(default_factory=list, max_length=30)
     cuisines: list[str] = Field(default_factory=list, max_length=10)
+    jain: bool = False  # no onion, garlic, root vegetables, mushroom, brinjal or honey
+    no_onion_garlic: bool = False
 
 
 class ProfileIn(BaseModel):

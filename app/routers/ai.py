@@ -1,7 +1,7 @@
 import logging
 import random
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import coach as coach_engine
 from app import credits, grocery, meal_engine
 from app.ai import gemini, prompts, safety
 from app.ai.schemas import (
@@ -20,11 +21,12 @@ from app.ai.schemas import (
     GroceryList,
     Meal,
     MealResults,
+    PlannedMeal,
 )
 from app.config import settings
 from app.db import get_session
 from app.deps import current_user
-from app.models import AiRequest, MealPlanEntry, User
+from app.models import AiRequest, FoodLog, MealPlanEntry, User
 from app.ratelimit import limit
 from app.routers.plans import (
     PlanDayOut,
@@ -41,17 +43,22 @@ MealType = Literal["breakfast", "lunch", "snack", "dinner"]
 MAX_GROCERY_DAYS = 14
 SLOTS = {3: ["breakfast", "lunch", "dinner"], 4: ["breakfast", "lunch", "snack", "dinner"], 5: ["breakfast", "lunch", "snack", "dinner"]}
 Tag = Literal["high_protein", "light", "quick", "spicy", "comfort", "budget", "low_oil", "high_fibre"]
-CoachId = Literal["protein_help", "hydration", "low_energy", "plateau", "eating_out", "motivation"]
+CoachId = Literal[
+    "what_to_eat", "under_400", "protein_help", "replace_dinner", "todays_diet", "analyze_week",
+    "hydration", "low_energy", "plateau", "eating_out", "motivation",
+]
 
 
 class FindMealIn(BaseModel):
     meal_type: MealType
     tags: list[Tag] = Field(default_factory=list, max_length=4)
-    max_minutes: Literal[10, 20, 30, 45, 60] = 30
+    max_minutes: Literal[10, 15, 20, 30, 45, 60] = 30
     max_kcal: int | None = Field(default=None, ge=100, le=1200)
     ingredients_at_home: list[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40)]] = Field(
         default_factory=list, max_length=8
     )
+    food_type: Literal["veg", "non_veg", "egg", "vegan", "jain"] | None = None
+    cuisine: Literal["south_indian", "north_indian"] | None = None
 
 
 class MealsOut(BaseModel):
@@ -111,11 +118,17 @@ class GroceryOut(BaseModel):
 
 class CoachIn(BaseModel):
     prompt_id: CoachId
+    meal_type: MealType | None = None  # which meal the user is asking about (defaults by time of day on the client)
+    today: date | None = None  # the user's local date, for "kcal left today" and the weekly review
 
 
 class CoachOut(BaseModel):
     message: str
     credits_left: int
+    meals: list[Meal] = Field(default_factory=list)
+    plan: list[PlannedMeal] = Field(default_factory=list)
+    tips: list[str] = Field(default_factory=list)
+    estimated: bool = True
     disclaimer: str = "General wellness information, not medical advice."
 
 
@@ -131,7 +144,14 @@ async def _run(session: AsyncSession, user: User, intent: str, payload: dict, ca
 
     try:
         result = await call()
-    except (gemini.AiUnavailable, safety_blocked, meal_engine.NoMealFound) as exc:
+    except meal_engine.NoMealFound:
+        log.info("ai %s: no recipe matches the request", intent)
+        await credits.refund(session, user.id, cost, request_id)
+        req = await session.get(AiRequest, request_id)
+        req.status = "failed"
+        await session.commit()
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "No meals match these choices. Try a higher calorie limit or fewer filters. Your credit was returned.")
+    except (gemini.AiUnavailable, safety_blocked) as exc:
         log.warning("ai %s failed: %s", intent, type(exc).__name__)
         await credits.refund(session, user.id, cost, request_id)
         req = await session.get(AiRequest, request_id)
@@ -187,6 +207,7 @@ async def find_meal(body: FindMealIn, user: User = Depends(current_user), sessio
             ok = meal_engine.find_meals(
                 profile, targets.kcal, body.meal_type, rng, tags=body.tags, max_minutes=body.max_minutes,
                 max_kcal=body.max_kcal, home=body.ingredients_at_home, slots=_slots_for_profile(profile),
+                food_type=body.food_type, cuisine=body.cuisine,
             )
             _guard(ok, profile)
         if not ok:
@@ -331,13 +352,41 @@ async def grocery_list(body: GroceryIn, user: User = Depends(current_user), sess
 async def coach(body: CoachIn, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
     profile = await require_profile(session, user)
     targets = await effective_targets(session, user.id, profile)
+    today = body.today or date.today()  # noqa: DTZ011
+    pid = body.prompt_id
+    slots = _slots_for_profile(profile)
+    rng = await _rng(session, user, today)
 
-    async def call() -> CoachReply:
-        out = await gemini.generate_json(prompts.SYSTEM, prompts.coach_prompt(profile, targets, body.prompt_id), CoachReply)
-        low = out.message.lower()
-        if any(c in low for c in safety.FORBIDDEN_CLAIMS):
-            raise safety_blocked()
-        return out
+    async def logs_since(start: date) -> list[coach_engine.DayLog]:
+        rows = (await session.execute(
+            select(FoodLog.logged_on, func.sum(FoodLog.kcal), func.sum(FoodLog.protein_g))
+            .where(FoodLog.user_id == user.id, FoodLog.logged_on >= start, FoodLog.logged_on <= today)
+            .group_by(FoodLog.logged_on)
+        )).all()
+        return [coach_engine.DayLog(d, float(k or 0), float(p or 0)) for d, k, p in rows]
 
-    reply, left = await _run(session, user, "coach_message", body.model_dump(), call)
-    return CoachOut(message=reply.message, credits_left=left)
+    async def call() -> coach_engine.CoachResult:
+        if _llm() and pid in ("hydration", "low_energy", "plateau", "eating_out", "motivation"):
+            out = await gemini.generate_json(prompts.SYSTEM, prompts.coach_prompt(profile, targets, pid), CoachReply)
+            if any(c in out.message.lower() for c in safety.FORBIDDEN_CLAIMS):
+                raise safety_blocked()
+            return coach_engine.CoachResult(message=out.message)
+        if pid in coach_engine.MEAL_PROMPTS:
+            eaten = sum(d.kcal for d in await logs_since(today))
+            slot = body.meal_type or "lunch"
+            res = coach_engine.meal_ideas(pid, profile, targets.kcal, targets.protein_g, slot, eaten, slots, rng)
+            _guard(res.meals, profile)
+            return res
+        if pid in coach_engine.PLAN_PROMPTS:
+            res = coach_engine.todays_diet(profile, targets.kcal, slots, rng)
+            _guard([m for _, m in res.plan], profile)
+            return res
+        if pid == "analyze_week":
+            return coach_engine.analyze_week(await logs_since(today - timedelta(days=6)), targets.kcal, targets.protein_g, today)
+        return coach_engine.text_reply(pid, targets.kcal, targets.protein_g)
+
+    res, left = await _run(session, user, "coach_message", body.model_dump(mode="json"), call)
+    return CoachOut(
+        message=res.message, credits_left=left, meals=res.meals,
+        plan=[PlannedMeal(meal_type=s_, **m.model_dump()) for s_, m in res.plan], tips=res.tips,
+    )

@@ -45,8 +45,8 @@ async def progress(
     days: int = Query(7), today: date | None = Query(None),
     user: User = Depends(current_user), session: AsyncSession = Depends(get_session),
 ):
-    if days not in (7, 30, 90):
-        raise HTTPException(422, "days must be 7, 30 or 90")
+    if days not in (7, 14, 30, 90):
+        raise HTTPException(422, "days must be 7, 14, 30 or 90")
     profile = await require_profile(session, user)
     today = today or date.today()  # noqa: DTZ011
     start = today - timedelta(days=days - 1)

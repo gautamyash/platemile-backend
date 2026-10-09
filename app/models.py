@@ -212,3 +212,17 @@ class Food(Base):
     fat_g: Mapped[float] = mapped_column(Float)
     fibre_g: Mapped[float] = mapped_column(Float)
     popularity: Mapped[int] = mapped_column(Integer, default=1000, index=True)  # lower = shown first
+
+
+class RecipeRow(Base):
+    """A meal-engine recipe. Seeded from app/meal_data on startup (insert-if-missing by name), then served from here,
+    so recipes can be added or edited in the database without a deploy. `data` holds the recipe dict."""
+
+    __tablename__ = "recipes"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(120), unique=True)
+    data: Mapped[dict] = mapped_column(JSON)
+    source: Mapped[str] = mapped_column(String(60), default="")
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

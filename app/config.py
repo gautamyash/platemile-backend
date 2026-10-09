@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     ai_mode: Literal["engine", "llm"] = "engine"  # engine = curated recipes, no LLM; llm = old Gemini path for meals/plans/grocery
     rate_limit_enabled: bool = True
     dev_login_enabled: bool = False  # local testing only; must stay False in production
-    support_email: str = "support@example.com"  # set to the real support address before launch
+    support_email: str = "gautamyash37@gmail.com"  # shown on the public pages and in emails; override with SUPPORT_EMAIL
 
     @field_validator("database_url")
     @classmethod

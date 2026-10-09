@@ -163,7 +163,7 @@ async def test_foods_catalogue_seeded_and_idempotent(client):
     from app.db import Base  # noqa: F401
     from app.seed_foods import FOODS, seed_foods
 
-    assert 140 <= len(FOODS) <= 200
+    assert 1000 <= len(FOODS) <= 1150
     assert all(f[3] >= 0 and f[4] >= 0 for f in FOODS)
     engine = create_async_engine(settings.database_url)
     assert await seed_foods(async_sessionmaker(engine, expire_on_commit=False)) == 0  # fixture already seeded
@@ -425,10 +425,10 @@ async def test_find_meal_steps_max_kcal_and_home_ingredients(client, user):
     assert any("paneer" in " ".join(x["ingredients"]).lower() or "curd" in " ".join(x["ingredients"]).lower() for x in meals)
     for bad in ({"max_kcal": 50}, {"max_kcal": 5000}, {"ingredients_at_home": [str(i) for i in range(9)]}):
         assert (await client.post("/ai/find-meal", headers=user, json={"meal_type": "lunch", **bad})).status_code == 422, bad
-    # no lunch can fit under 100 kcal even at a reduced portion -> friendly 503 and the credit is returned
+    # no lunch can fit under 100 kcal even at a reduced portion -> clear 422 and the credit is returned
     before = await credits_of(client, user)
     r = await client.post("/ai/find-meal", headers=user, json={"meal_type": "lunch", "max_kcal": 100})
-    assert r.status_code == 503 and "returned" in r.json()["detail"]
+    assert r.status_code == 422 and "No meals match" in r.json()["detail"] and "returned" in r.json()["detail"]
     assert await credits_of(client, user) == before
 
 
@@ -471,7 +471,7 @@ async def test_ai_plan_failure_refunds_and_keeps_old_plan(client, user, monkeypa
     await client.put("/plans/2026-11-01/meals/lunch", headers=user, json={**MEAL_BODY, "name": "Keep me"})
     monkeypatch.setattr(meal_engine, "RECIPES", [])
     r = await client.post("/ai/plan", headers=user, json={"start_date": "2026-11-01", "days": 7, "meals_per_day": 3})
-    assert r.status_code == 503 and "returned" in r.json()["detail"]
+    assert r.status_code == 422 and "returned" in r.json()["detail"]
     assert await credits_of(client, user) == 50
     hist = (await client.get("/credits", headers=user)).json()["history"]
     assert [(h["reason"], h["delta"]) for h in hist[:2]] == [("refund", 5), ("reserve", -5)]
@@ -480,7 +480,7 @@ async def test_ai_plan_failure_refunds_and_keeps_old_plan(client, user, monkeypa
 
 async def test_ai_plan_with_an_uncovered_slot_is_refused_and_refunded(client, user, monkeypatch):
     monkeypatch.setattr(meal_engine, "RECIPES", [r for r in meal_engine.RECIPES if "lunch" not in r.meal_types])
-    assert (await client.post("/ai/plan", headers=user, json={"start_date": "2026-11-01", "days": 1, "meals_per_day": 3})).status_code == 503
+    assert (await client.post("/ai/plan", headers=user, json={"start_date": "2026-11-01", "days": 1, "meals_per_day": 3})).status_code == 422
     assert await credits_of(client, user) == 50
     assert (await client.get("/plans", params={"from": "2026-11-01", "to": "2026-11-07"}, headers=user)).json() == {"days": []}
 
@@ -536,7 +536,7 @@ async def test_replace_meal_without_plan_date_is_safe_for_the_profile(client, us
 
 async def test_replace_meal_failure_refunds_and_validation(client, user, monkeypatch):
     monkeypatch.setattr(meal_engine, "RECIPES", [])
-    assert (await client.post("/ai/replace-meal", headers=user, json=RM)).status_code == 503
+    assert (await client.post("/ai/replace-meal", headers=user, json=RM)).status_code == 422
     assert await credits_of(client, user) == 50
     for bad in ({"reason": "because"}, {"meal_type": "brunch"}, {"current_name": ""}, {"current_name": "x" * 101}, {"plan_date": "x"}):
         assert (await client.post("/ai/replace-meal", headers=user, json={**RM, **bad})).status_code == 422, bad
@@ -634,3 +634,40 @@ async def test_export_and_delete_include_new_data(client, user):
     assert exp["settings"]["data"]["theme"] == "dark" and exp["target_override"]["kcal"] == 1800
     assert len(exp["meal_plan_entries"]) == 1 and len(exp["saved_meals"]) == 1 and len(exp["reports"]) == 1
     assert (await client.delete("/me", headers=user)).status_code == 204  # cascades through every new table
+
+
+# ---------------------------------------------------------------- public legal pages
+@pytest.mark.parametrize("path,needle", [("/", "PlateMile"), ("/privacy", "Health Connect"), ("/terms", "not medical advice"),
+                                         ("/delete-account", "Delete my account"), ("/licences", "MIT")])
+async def test_public_pages(client, path, needle):
+    r = await client.get(path)
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/html") and needle in r.text
+
+
+async def test_recipes_live_in_database(client):
+    """Recipes are seeded into the recipes table, served from it, and survive re-seeding and DB edits."""
+    from sqlalchemy import func, select, update
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app import meal_engine
+    from app.config import settings
+    from app.models import RecipeRow
+    from app.seed_recipes import seed_recipes
+
+    maker = async_sessionmaker(create_async_engine(settings.database_url), expire_on_commit=False)
+    async with maker() as s:
+        total = await s.scalar(select(func.count()).select_from(RecipeRow))
+    assert total == len(meal_engine.file_recipe_dicts()) >= 400
+    assert await seed_recipes(maker) == total  # idempotent, all served
+    assert len(meal_engine.RECIPES) == total and not meal_engine.SKIPPED
+    # deactivating a row in the database removes it from the engine
+    name = meal_engine.RECIPES[0].name
+    async with maker() as s:
+        await s.execute(update(RecipeRow).where(RecipeRow.name == name).values(active=False))
+        await s.commit()
+    assert await seed_recipes(maker) == total - 1
+    assert name.lower() not in meal_engine.BY_NAME
+    async with maker() as s:
+        await s.execute(update(RecipeRow).where(RecipeRow.name == name).values(active=True))
+        await s.commit()
+    assert await seed_recipes(maker) == total

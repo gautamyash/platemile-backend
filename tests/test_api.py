@@ -84,7 +84,7 @@ async def test_failed_ai_refunds_credit(client, monkeypatch):
 
     monkeypatch.setattr("app.meal_engine.RECIPES", [])  # engine cannot serve anything -> failure path
     r = await client.post("/ai/daily-plan", headers=h)
-    assert r.status_code == 503
+    assert r.status_code == 422 and "credit was returned" in r.json()["detail"]
     assert (await client.get("/me", headers=h)).json()["credits"] == 50
     hist = (await client.get("/credits", headers=h)).json()["history"]
     assert [x["reason"] for x in hist][:2] == ["refund", "reserve"]
@@ -99,6 +99,9 @@ async def test_no_credits_returns_402_without_calling_model(client, monkeypatch)
         called.append(1)
         return CoachReply(message="Drink water.")
 
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "ai_mode", "llm")  # the model path: it must not be called once credits run out
     monkeypatch.setattr(gemini, "generate_json", fake)
     for _ in range(50):
         assert (await client.post("/ai/coach", headers=h, json={"prompt_id": "hydration"})).status_code == 200

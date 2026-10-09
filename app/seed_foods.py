@@ -10,6 +10,9 @@ import logging
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.food_data_more import FOODS_MORE
+from app.food_data_more2 import FOODS_MORE2
+from app.food_data_more3 import FOODS_MORE3
 from app.models import Food
 
 log = logging.getLogger("seed")
@@ -142,7 +145,7 @@ FOODS: list[tuple[str, str, str, float, float, float, float, float]] = [
     ("Paneer, raw", "cottage cheese,paneer cubes", "100 g", 265, 18, 3.5, 20, 0),
     ("Raita", "boondi raita,cucumber raita,veg raita", "1 katori (100 g)", 75, 3.5, 6, 4, 0.5),
     ("Filter coffee", "south indian coffee,coffee with milk", "1 cup (150 ml)", 80, 3, 9, 3.5, 0),
-    ("Black coffee", "coffee,americano", "1 cup (200 ml)", 5, 0.3, 0.8, 0, 0),
+    ("Black coffee", "coffee", "1 cup (200 ml)", 5, 0.3, 0.8, 0, 0),
     ("Green tea", "tea without milk,black tea", "1 cup (200 ml)", 3, 0, 0.5, 0, 0),
     ("Coconut water", "nariyal pani,tender coconut water", "1 glass (250 ml)", 50, 0.5, 12, 0.3, 1.5),
     ("Fresh lime water", "nimbu pani,lemonade,shikanji", "1 glass (250 ml)", 60, 0.2, 15, 0, 0.2),
@@ -181,7 +184,7 @@ FOODS: list[tuple[str, str, str, float, float, float, float, float]] = [
     # --- fats, sauces, extras ---
     ("Ghee", "clarified butter,desi ghee", "1 tsp (5 g)", 45, 0, 0, 5, 0),
     ("Butter", "makhan", "1 tsp (5 g)", 36, 0, 0, 4, 0),
-    ("Cooking oil", "sunflower oil,mustard oil,refined oil,tel", "1 tsp (5 ml)", 45, 0, 0, 5, 0),
+    ("Cooking oil", "sunflower oil,refined oil,tel", "1 tsp (5 ml)", 45, 0, 0, 5, 0),
     ("Green chutney", "mint chutney,pudina chutney,coriander chutney", "2 tbsp (30 g)", 20, 0.8, 3, 0.5, 1),
     ("Coconut chutney", "nariyal chutney", "2 tbsp (30 g)", 55, 0.8, 2, 5, 1.2),
     ("Tomato soup", "tamatar soup", "1 bowl (200 ml)", 80, 2, 14, 2, 1.5),
@@ -190,11 +193,15 @@ FOODS: list[tuple[str, str, str, float, float, float, float, float]] = [
     ("Peanut chikki", "groundnut chikki,chikki,gajak", "1 piece (30 g)", 150, 3.5, 17, 8, 1.5),
     ("Pizza slice", "veg pizza,cheese pizza", "1 slice (110 g)", 280, 11, 33, 11, 2),
     ("French fries", "chips,aloo fries", "1 medium (100 g)", 310, 3.5, 40, 15, 3.5),
-    ("Veg burger", "aloo tikki burger,burger", "1 burger (170 g)", 340, 9, 45, 14, 3.5),
+    ("Veg burger", "burger", "1 burger (170 g)", 340, 9, 45, 14, 3.5),
     ("Maggi noodles", "instant noodles,maggi,masala noodles", "1 packet (70 g)", 320, 7, 44, 13, 2),
     ("Hakka noodles", "veg noodles,chowmein,chow mein", "1 plate (250 g)", 420, 10, 62, 15, 4),
     ("Veg momos", "momo,steamed momos,dumplings", "6 pieces (150 g)", 240, 8, 40, 5, 3),
 ]
+
+# More foods (regional dishes, fruits, drinks, sweets, snacks, non-veg dishes). Listed after the staples so the
+# popular list stays the same.
+FOODS = FOODS + FOODS_MORE + FOODS_MORE2 + FOODS_MORE3
 
 
 async def seed_foods(maker: async_sessionmaker[AsyncSession]) -> int:

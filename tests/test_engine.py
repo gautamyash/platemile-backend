@@ -455,18 +455,119 @@ async def test_everything_but_coach_works_without_gemini(client, user, no_gemini
     assert not no_gemini
 
 
-async def test_coach_still_uses_gemini_and_refunds_on_failure(client, user, no_gemini):
+async def test_coach_in_llm_mode_uses_gemini_and_refunds_on_failure(client, user, no_gemini, monkeypatch):
+    monkeypatch.setattr(settings, "ai_mode", "llm")
     r = await client.post("/ai/coach", headers=user, json={"prompt_id": "hydration"})
     assert r.status_code == 503 and no_gemini and await credits_of(client, user) == 50
 
 
-async def test_coach_success_path(client, user, monkeypatch):
+async def test_coach_llm_success_path(client, user, monkeypatch):
     async def ok(system, prompt, schema):
         return CoachReply(message="Sip water through the day.")
 
+    monkeypatch.setattr(settings, "ai_mode", "llm")
     monkeypatch.setattr(gemini, "generate_json", ok)
     r = await client.post("/ai/coach", headers=user, json={"prompt_id": "hydration"})
-    assert r.status_code == 200 and r.json()["credits_left"] == 49
+    assert r.status_code == 200 and r.json()["credits_left"] == 49 and r.json()["message"] == "Sip water through the day."
+
+
+@pytest.mark.parametrize("pid", ["what_to_eat", "under_400", "protein_help", "replace_dinner", "todays_diet", "analyze_week",
+                                 "hydration", "low_energy", "plateau", "eating_out", "motivation"])
+async def test_coach_every_prompt_works_without_gemini(client, user, no_gemini, pid):
+    r = await client.post("/ai/coach", headers=user, json={"prompt_id": pid, "meal_type": "dinner", "today": "2026-12-01"})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["message"] and j["credits_left"] == 49 and not no_gemini
+    if pid in ("what_to_eat", "under_400", "protein_help", "replace_dinner"):
+        assert len(j["meals"]) == 3
+    if pid == "under_400":
+        assert all(m["kcal"] <= 400 for m in j["meals"])
+    if pid == "replace_dinner":
+        assert j["meals"]
+    if pid == "todays_diet":
+        assert len(j["plan"]) >= 3 and len({m["name"] for m in j["plan"]}) == len(j["plan"])
+    low = j["message"].lower() + " ".join(j["tips"]).lower()
+    assert not any(c in low for c in safety.FORBIDDEN_CLAIMS)
+
+
+async def test_coach_weekly_review_uses_logs(client, user):
+    for d in ("2026-12-01", "2026-12-02"):
+        r = await client.post("/logs/food", headers=user, json={"logged_on": d, "meal_type": "lunch", "name": "Dal rice", "kcal": 600, "protein_g": 20})
+        assert r.status_code in (200, 201), r.text
+    j = (await client.post("/ai/coach", headers=user, json={"prompt_id": "analyze_week", "today": "2026-12-02"})).json()
+    assert "2 of the last 7 days" in j["message"] and "600 kcal" in j["message"]
+
+
+async def test_coach_what_to_eat_respects_kcal_left(client, user):
+    r = await client.post("/logs/food", headers=user, json={"logged_on": "2026-12-03", "meal_type": "lunch", "name": "Big lunch", "kcal": 1300, "protein_g": 30})
+    assert r.status_code in (200, 201)
+    j = (await client.post("/ai/coach", headers=user, json={"prompt_id": "what_to_eat", "meal_type": "dinner", "today": "2026-12-03"})).json()
+    assert "left today" in j["message"]
+
+
+# ---------------------------------------------------------------- finder chips, Jain and no onion/garlic
+JAIN_WORDS = {"onion", "garlic", "potato", "aloo", "carrot", "beetroot", "radish", "ginger", "mushroom", "brinjal", "baingan", "honey"}
+
+
+def _jain_clean(meal) -> bool:
+    text = (meal["name"] + " " + " ".join(meal["ingredients"])).lower()
+    for ph in ("dry ginger", "dried ginger", "ginger powder"):
+        text = text.replace(ph, " ")
+    return not (JAIN_WORDS & safety._tokenize(text))
+
+
+@pytest.mark.parametrize("slot", SLOTS4)
+async def test_finder_jain_chip_is_strict(client, user, slot):
+    for _ in range(4):
+        r = await client.post("/ai/find-meal", headers=user, json={"meal_type": slot, "food_type": "jain", "max_minutes": 60})
+        assert r.status_code == 200, r.text
+        for m in r.json()["meals"]:
+            assert _jain_clean(m), m["name"]
+
+
+async def test_jain_profile_applies_everywhere(client):
+    h, _ = await login(client, "JAIN1")
+    prof = {**PROFILE, "diet_type": "veg", "restrictions": {"allergies": [], "dislikes": [], "jain": True}}
+    assert (await client.put("/profile", json=prof, headers=h)).status_code == 200
+    assert (await client.get("/profile", headers=h)).json()["restrictions"]["jain"] is True
+    r = await client.post("/ai/plan", headers=h, json={"start_date": "2026-12-01", "days": 7, "meals_per_day": 4})
+    assert r.status_code == 200, r.text
+    for d in r.json()["plan_days"]:
+        for m in d["meals"]:
+            assert _jain_clean(m), m["name"]
+    r = await client.post("/ai/find-meal", headers=h, json={"meal_type": "dinner", "max_minutes": 60})
+    assert all(_jain_clean(m) for m in r.json()["meals"])
+
+
+async def test_no_onion_garlic_profile(client):
+    h, _ = await login(client, "NOG1")
+    prof = {**PROFILE, "diet_type": "non_veg", "restrictions": {"allergies": [], "dislikes": [], "no_onion_garlic": True}}
+    assert (await client.put("/profile", json=prof, headers=h)).status_code == 200
+    for slot in SLOTS4:
+        r = await client.post("/ai/find-meal", headers=h, json={"meal_type": slot, "max_minutes": 60})
+        assert r.status_code == 200, r.text
+        for m in r.json()["meals"]:
+            toks = safety._tokenize(m["name"] + " " + " ".join(m["ingredients"]))
+            assert not ({"onion", "garlic"} & toks), m["name"]
+
+
+@pytest.mark.parametrize("food_type,ok_diets", [("vegan", {"vegan"}), ("veg", {"vegan", "veg"}), ("egg", {"egg"}), ("non_veg", {"nonveg"})])
+async def test_finder_food_type_chip(client, food_type, ok_diets):
+    h, _ = await login(client, f"FT{food_type}")
+    assert (await client.put("/profile", json={**PROFILE, "diet_type": "non_veg"}, headers=h)).status_code == 200
+    by_name = {r.name: r.diet for r in RECIPES}
+    for slot in SLOTS4:
+        r = await client.post("/ai/find-meal", headers=h, json={"meal_type": slot, "food_type": food_type, "max_minutes": 15, "cuisine": "south_indian"})
+        assert r.status_code == 200, r.text
+        assert all(by_name[m["name"]] in ok_diets for m in r.json()["meals"])
+
+
+async def test_finder_chip_never_widens_profile_diet(client):
+    h, _ = await login(client, "VEGNV")
+    assert (await client.put("/profile", json={**PROFILE, "diet_type": "veg"}, headers=h)).status_code == 200
+    by_name = {r.name: r.diet for r in RECIPES}
+    r = await client.post("/ai/find-meal", headers=h, json={"meal_type": "lunch", "food_type": "non_veg"})
+    assert r.status_code == 200 and all(by_name[m["name"]] in {"veg", "vegan"} for m in r.json()["meals"])
 
 
 async def test_plan_persists_exactly_what_is_returned(client, user):
@@ -502,10 +603,10 @@ async def test_api_find_meal_many_times_respects_vegan_peanut_and_dislike(client
     assert len(counts) >= 25  # lots of variety
 
 
-async def test_no_eligible_recipe_is_503_with_refund(client, user, monkeypatch):
+async def test_no_eligible_recipe_is_422_with_refund(client, user, monkeypatch):
     monkeypatch.setattr(meal_engine, "RECIPES", [r for r in RECIPES if r.diet == "nonveg"])  # nothing a veg user may eat
     r = await client.post("/ai/find-meal", headers=user, json={"meal_type": "lunch"})
-    assert r.status_code == 503 and "Your credit was returned" in r.json()["detail"]
+    assert r.status_code == 422 and "No meals match" in r.json()["detail"] and "credit was returned" in r.json()["detail"]
     assert await credits_of(client, user) == 50
 
 
